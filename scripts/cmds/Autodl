@@ -1,0 +1,119 @@
+const axios = require("axios");
+const fs = require("fs-extra");
+const path = require("path");
+const { execSync } = require("child_process");
+
+const { configCommands } = global.GoatBot;
+const { log, loadScripts } = global.utils;
+
+// Node.js built-in modules — never try to npm-install these
+const NODE_BUILTINS = new Set([
+  "fs", "path", "crypto", "os", "http", "https", "url", "util",
+  "events", "stream", "buffer", "child_process", "querystring",
+  "assert", "zlib", "net", "tls", "dns", "readline", "vm",
+  "module", "process", "timers", "string_decoder", "punycode",
+  "v8", "perf_hooks", "async_hooks"
+]);
+
+// Detect if message body contains a JS command file (broad match)
+function isJsCode(body) {
+  if (!body || body.length < 20) return false;
+  return body.includes("module.exports") && body.includes("config");
+}
+
+// Detect .js file attachment
+function getJsAttachment(attachments) {
+  if (!attachments || !attachments.length) return null;
+  return attachments.find(a => {
+    if (!a) return false;
+    const name = (a.name || a.filename || "").toLowerCase();
+    const url  = (a.url  || "").toLowerCase();
+    return name.endsWith(".js") || url.includes(".js");
+  }) || null;
+}
+
+// Extract command name from config.name
+function extractCommandName(code) {
+  const match = code.match(/name\s*:\s*["'`]([^"'`]+)["'`]/);
+  return match ? match[1].trim() : null;
+}
+
+// Extract all require()'d package names from code
+function extractRequiredPackages(code) {
+  const re = /require\s*\(\s*["'`]([^"'`]+)["'`]\s*\)/g;
+  const pkgs = new Set();
+  let m;
+  while ((m = re.exec(code)) !== null) {
+    let pkg = m[1];
+    // Skip relative paths
+    if (pkg.startsWith(".") || pkg.startsWith("/")) continue;
+    // Normalize scoped packages: @user/pkg/deep → @user/pkg
+    if (pkg.startsWith("@"))
+      pkg = pkg.split("/").slice(0, 2).join("/");
+    else
+      pkg = pkg.split("/")[0];
+    // Skip built-ins
+    if (NODE_BUILTINS.has(pkg)) continue;
+    pkgs.add(pkg);
+  }
+  return [...pkgs];
+}
+
+// Try to install missing packages; return { installed[], failed[] }
+function installMissingPackages(packages) {
+  const installed = [];
+  const failed = [];
+  const nodeModulesDir = path.join(process.cwd(), "node_modules");
+
+  for (const pkg of packages) {
+    if (fs.existsSync(path.join(nodeModulesDir, pkg))) continue; // already installed
+    try {
+      execSync(`npm install ${pkg} --save --prefer-offline`, {
+        stdio: "pipe",
+        cwd: process.cwd()
+      });
+      installed.push(pkg);
+    } catch (err) {
+      failed.push(pkg);
+    }
+  }
+  return { installed, failed };
+}
+
+// Auto-fix common issues in JS command files
+function autoFix(code) {
+  // Redirect bare "fs" imports to fs-extra
+  code = code.replace(/require\s*\(\s*["'`]fs["'`]\s*\)/g, `require("fs-extra")`);
+  // Remove lines that try to npm-install built-in modules
+  code = code.replace(/.*execSync\s*\(.*npm install.*(fs|crypto|path|os|http|https|url|util).*\).*/g, "");
+  // Remove stray `^` at very top of file
+  code = code.replace(/^\s*\^\s*\n/, "");
+  // Fix aliases that are a plain string instead of array
+  code = code.replace(/(aliases\s*:\s*)([^[\],\n{][^\n,]*)(,|\n)/g, (m, p1, p2, p3) => {
+    const trimmed = p2.trim();
+    if (trimmed.startsWith("[")) return m;
+    if (/^["'`]/.test(trimmed)) return `${p1}[${trimmed}]${p3}`;
+    return m;
+  });
+  return code;
+}
+
+module.exports = {
+  config: {
+    name: "autoinstall",
+    version: "1.2",
+    author: "Agent",
+    role: 2,
+    countDown: 5,
+    category: "owner",
+    description: "Auto-install a JS command — paste code directly in chat or send as .js attachment",
+    guide: "Paste any JS command code in chat (needs module.exports + config) or send a .js file as attachment."
+  },
+
+  onStart: async function ({ message }) {
+    message.reply(
+      "📦 AutoInstall v1.2 active!\n\n" +
+      "Two ways to install a command:\n" +
+      "1️⃣ Paste JS code directly in chat\n" +
+      "2️⃣ Send a .js file as attachment\n\n" +
+      "Bot reacts ⏳ w...
